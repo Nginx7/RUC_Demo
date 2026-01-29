@@ -1,6 +1,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <algorithm>
+#include <cmath>
 #include "brain_tree.h"
 #include "locator.h"
 #include "brain.h"
@@ -700,92 +701,143 @@ NodeStatus GoToGoalBlockingPosition::tick() {
 }
 
 NodeStatus Assist::tick() {
+    // 日志
     auto log = [=](string msg) {
         brain->log->setTimeNow();
-        brain->log->log("debug/Assist", rerun::TextLog(msg));
+        brain->log->log("debug/Assist_Pro", rerun::TextLog(msg));
     };
-    log("ticked");
 
     double distTolerance = getInput<double>("dist_tolerance").value();
     double thetaTolerance = getInput<double>("theta_tolerance").value();
-    double distToGoalline = getInput<double>("dist_to_goalline").value();
+    // double distToGoalline = getInput<double>("dist_to_goalline").value(); // 暂时不用，用动态边界
 
     auto fd = brain->config->fieldDimensions;
     auto ballPos = brain->data->ball.posToField;
     auto robotPose = brain->data->robotPoseToField;
-    string curRole = brain->tree->getEntry<string>("player_role");
 
+    // ==========================================
+    // 1. 团队角色分配 (保留原代码逻辑)
+    // ==========================================
     bool isSecondary = false; 
-    bool has2Assists = false;
     int selfIdx = brain->config->playerId - 1;
+    
+    // 简单的协作逻辑：如果有一个队友也是 Striker 且他在我前面，那我是副手
     for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++) {
         if (i == selfIdx) continue; 
 
         auto tmStatus = brain->data->tmStatus[i];
         if (!tmStatus.isAlive) continue; 
-        if (tmStatus.isLead) continue; 
-        if (tmStatus.role != "striker") continue; 
+        if (tmStatus.isLead) continue; // 队长通常是持球者
+        // if (tmStatus.role != "striker") continue; // 如果你们策略里所有人都是 striker
 
-        has2Assists = true;
-        log("2 assists found");
+        // 判定条件：如果队友离球门更近（进攻方向x更大），或者离球更近
+        // 这里沿用你的简单判定：谁 x 大谁是主助攻（更靠前接应）
         if (tmStatus.robotPoseToField.x > robotPose.x) {
-            log("i am secondary");
             isSecondary = true; 
         }
     }
-    log(format("has2Assists: %d, isSecondary: %d", has2Assists, isSecondary));
+    log(format("Role: %s", isSecondary ? "Secondary (Back)" : "Primary (Front)"));
 
-
+    // ==========================================
+    // 2. 战术站位计算 (三角进攻优化)
+    // ==========================================
     Pose2D targetPose;
-    targetPose.x = isSecondary ? ballPos.x - 4.0 : ballPos.x - 2.0;
-    targetPose.x = max(targetPose.x, - fd.length / 2.0 + distToGoalline); 
-    targetPose.y = ballPos.y * (targetPose.x + fd.length / 2.0) / (ballPos.x + fd.length / 2.0); 
-    if (has2Assists) { 
-        targetPose.y += isSecondary ? - 0.5 : 0.5;
+    
+    // 策略：
+    // 主助攻 (Primary): 去球的“弱侧”接应（球在左他就去右），形成交叉传球路线。
+    // 副助攻 (Secondary): 去球的“强侧”保护，或者拖后防止反击。
+    
+    double sideSign = (ballPos.y > 0) ? -1.0 : 1.0; // 球在左(>0)，弱侧是右(-1)
+
+    if (!isSecondary) {
+        // 主力：去弱侧，靠前一点
+        targetPose.x = ballPos.x - 1.5; 
+        targetPose.y = ballPos.y + sideSign * 2.5; 
+    } else {
+        // 副手：去强侧(同侧)，或者拖在正后方保护
+        // 选择拖后保护更稳妥
+        targetPose.x = ballPos.x - 3.5; 
+        targetPose.y = ballPos.y * 0.5; // 稍微向中间靠
     }
 
+    // 边界限制 (Smart Clamping)
+    double safeMargin = 0.8;
+    // 1. 场宽限制
+    targetPose.y = std::max(-fd.width/2 + safeMargin, std::min(fd.width/2 - safeMargin, targetPose.y));
+    // 2. 场长限制 (不退到底线外，也不冲进对方禁区太深)
+    targetPose.x = std::max(-fd.length/2 + 0.6, targetPose.x);
+    if (targetPose.x > fd.length/2 - fd.goalAreaLength) targetPose.x = fd.length/2 - fd.goalAreaLength;
 
-    double dist = norm(targetPose.x - robotPose.x, targetPose.y - robotPose.y);
-    if ( 
-        dist < distTolerance
-        && fabs(brain->data->ball.yawToRobot) < thetaTolerance
-    ) {
+    // 朝向：始终看向球
+    targetPose.theta = atan2(ballPos.y - targetPose.y, ballPos.x - targetPose.x);
+
+    // ==========================================
+    // 3. 运动控制 (P控制 + 势场避障)
+    // ==========================================
+    double dist = std::hypot(targetPose.x - robotPose.x, targetPose.y - robotPose.y);
+    double errTheta = toPInPI(targetPose.theta - robotPose.theta);
+
+    // 到位判断
+    if (dist < distTolerance && std::fabs(errTheta) < thetaTolerance) {
         brain->client->setVelocity(0, 0, 0);
         return NodeStatus::SUCCESS;
     }
 
-    double vx, vy, vtheta;
-    auto targetPose_r = brain->data->field2robot(targetPose);
-    double targetDir = atan2(targetPose_r.y, targetPose_r.x);
-    double distToObstacle = brain->distToObstacle(targetDir);
-
-    bool avoidObstacle;
-    brain->get_parameter("obstacle_avoidance.avoid_during_chase", avoidObstacle);
-    double oaSafeDist;
-    brain->get_parameter("obstacle_avoidance.chase_ao_safe_dist", oaSafeDist);
-
-    if (avoidObstacle && distToObstacle < oaSafeDist) {
-        log("avoid obstacle");
-        auto avoidDir = brain->calcAvoidDir(targetDir, oaSafeDist);
-        const double speed = 0.5;
-        vx = speed * cos(avoidDir);
-        vy = speed * sin(avoidDir);
-        vtheta = brain->data->ball.yawToRobot;
-    } else {
-        vx = targetPose_r.x;
-        vy = targetPose_r.y;
-        vtheta = brain->data->ball.yawToRobot * 4.0; 
+    // 基础速度 (P Control)
+    double kp = 1.2;
+    double v_gx = kp * (targetPose.x - robotPose.x);
+    double v_gy = kp * (targetPose.y - robotPose.y);
+    
+    // 避障 (Potential Field) - 替代原有的 calculateAvoidDir
+    // 这是一个更平滑的算法，会产生一个推力把机器人推离障碍物
+    double rep_force_x = 0;
+    double rep_force_y = 0;
+    
+    // 检查球作为障碍物 (防止踩球)
+    double distToBall = std::hypot(robotPose.x - ballPos.x, robotPose.y - ballPos.y);
+    if (distToBall < 0.6) { // 0.6米内避让球
+        double force = 1.0 * (1.0/distToBall - 1.0/0.6);
+        rep_force_x += force * (robotPose.x - ballPos.x) / distToBall;
+        rep_force_y += force * (robotPose.y - ballPos.y) / distToBall;
     }
 
+    // 检查其他障碍物 (如果有数据)
+    // 假设 brain->data->getObstacles() 可用，如果不可用可以注释掉
+    /* for (const auto& obs : brain->data->getObstacles()) {
+        double d = std::hypot(robotPose.x - obs.posToField.x, robotPose.y - obs.posToField.y);
+        if (d < 0.6) {
+             double force = 0.8 * (1.0/d - 1.0/0.6);
+             rep_force_x += force * (robotPose.x - obs.posToField.x) / d;
+             rep_force_y += force * (robotPose.y - obs.posToField.y) / d;
+        }
+    }
+    */
 
+    // 叠加避障力
+    v_gx += rep_force_x;
+    v_gy += rep_force_y;
+
+    // 转为机器人坐标系
+    double vx = v_gx * cos(robotPose.theta) + v_gy * sin(robotPose.theta);
+    double vy = -v_gx * sin(robotPose.theta) + v_gy * cos(robotPose.theta);
+    double vtheta = 1.5 * errTheta;
+
+    // 限幅 (Speed Limit)
     double vxLimit, vyLimit;
-    getInput("vx_limit", vxLimit);
-    getInput("vy_limit", vyLimit);
-    vx = cap(vx, vxLimit, -1.0);     
-    vy = cap(vy, vyLimit, -vyLimit);     
+    if (!getInput("vx_limit", vxLimit)) vxLimit = 1.0;
+    if (!getInput("vy_limit", vyLimit)) vyLimit = 0.6;
     
+    vx = cap(vx, vxLimit, -vxLimit);
+    vy = cap(vy, vyLimit, -vyLimit);
+    vtheta = cap(vtheta, 1.5, -1.5);
 
+    // 执行
     brain->client->setVelocity(vx, vy, vtheta, false, false, false);
+    
+    // 可视化
+    brain->log->setTimeNow();
+    brain->log->logBall("field/assist_target", Point({targetPose.x, targetPose.y, 0}), isSecondary ? 0xCCCCCCFF : 0xFFFF00FF, false, false);
+
     return NodeStatus::SUCCESS;
 }
 
