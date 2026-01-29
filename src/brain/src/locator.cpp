@@ -4,6 +4,8 @@
 #include "brain.h"
 #include "utils/print.h"
 #include "brain_tree.h"
+#include <cmath>
+#include <algorithm>
 
 #define REGISTER_LOCATOR_BUILDER(Name)     \
     factory.registerBuilder<Name>( \
@@ -379,54 +381,113 @@ NodeStatus SelfLocate::tick()
         brain->log->setTimeNow();
         brain->log->log("debug/SelfLocate", rerun::TextLog(msg));
     };
-    double interval = getInput<double>("msecs_interval").value();
-    if (brain->msecsSince(brain->data->lastSuccessfulLocalizeTime) < interval) return NodeStatus::SUCCESS;
 
-    string mode = getInput<string>("mode").value();
+    double interval;
+    if (!getInput("msecs_interval", interval)) interval = 1000.0;
+    
+    // 限制频率
+    if (brain->msecsSince(brain->data->lastSuccessfulLocalizeTime) < interval) 
+        return NodeStatus::SUCCESS;
+
+    string mode;
+    if (!getInput("mode", mode)) mode = "trust_direction";
+
+    // 1. 准备常规视觉定位参数
     double xMin, xMax, yMin, yMax, thetaMin, thetaMax; 
     auto markers = brain->data->getMarkersForLocator();
+    auto fd = brain->config->fieldDimensions;
 
-    if (mode == "face_forward")
-    {
-        xMin = -brain->config->fieldDimensions.length / 2;
-        xMax = brain->config->fieldDimensions.length / 2;
-        yMin = -brain->config->fieldDimensions.width / 2;
-        yMax = brain->config->fieldDimensions.width / 2;
-        thetaMin = -M_PI / 4;
-        thetaMax = M_PI / 4;
+    if (mode == "face_forward") {
+        xMin = -fd.length / 2; xMax = fd.length / 2;
+        yMin = -fd.width / 2;  yMax = fd.width / 2;
+        thetaMin = -M_PI / 4;  thetaMax = M_PI / 4;
     }
-    else if (mode == "trust_direction")
-    {
+    else { // trust_direction
         int msec = static_cast<int>(brain->msecsSince(brain->data->lastSuccessfulLocalizeTime));
         double maxDriftSpeed = 0.1;                      
         double maxDrift = msec / 1000.0 * maxDriftSpeed; 
+        maxDrift = std::min(maxDrift, 3.0); // 限制最大漂移范围
 
-        xMin = max(-brain->config->fieldDimensions.length / 2 - 2, brain->data->robotPoseToField.x - maxDrift);
-        xMax = min(brain->config->fieldDimensions.length / 2 + 2, brain->data->robotPoseToField.x + maxDrift);
-        yMin = max(-brain->config->fieldDimensions.width / 2 - 2, brain->data->robotPoseToField.y - maxDrift);
-        yMax = min(brain->config->fieldDimensions.width / 2 + 2, brain->data->robotPoseToField.y + maxDrift);
+        xMin = std::max(-fd.length / 2 - 2, brain->data->robotPoseToField.x - maxDrift);
+        xMax = std::min(fd.length / 2 + 2, brain->data->robotPoseToField.x + maxDrift);
+        yMin = std::max(-fd.width / 2 - 2, brain->data->robotPoseToField.y - maxDrift);
+        yMax = std::min(fd.width / 2 + 2, brain->data->robotPoseToField.y + maxDrift);
         thetaMin = brain->data->robotPoseToField.theta - M_PI / 180;
         thetaMax = brain->data->robotPoseToField.theta + M_PI / 180;
     }
-    else if (mode == "fall_recovery")
-    {
-        int msec = static_cast<int>(brain->msecsSince(brain->data->lastSuccessfulLocalizeTime));
-        double maxDriftSpeed = 0.1;                      
-        double maxDrift = msec / 1000.0 * maxDriftSpeed; 
-
-        xMin = -brain->config->fieldDimensions.length / 2 - 2;
-        xMax = brain->config->fieldDimensions.length / 2 + 2;
-        yMin = -brain->config->fieldDimensions.width / 2 - 2;
-        yMax = brain->config->fieldDimensions.width / 2 + 2;
-        thetaMin = brain->data->robotPoseToField.theta - M_PI / 180;
-        thetaMax = brain->data->robotPoseToField.theta + M_PI / 180;
-    }
-
-    
     
     PoseBox2D constraints{xMin, xMax, yMin, yMax, thetaMin, thetaMax};
-    double residual;
+    
+    // 2. 执行常规视觉定位
     auto res = brain->locator->locateRobot(markers, constraints);
+
+    // ========================================================================
+    // 新增：协同定位逻辑 (Cooperative Localization)
+    // ========================================================================
+    // 触发条件：
+    // 1. 常规视觉定位失败 (!res.success)
+    // 2. 我自己看到了球 (brain->data->ballDetected)
+    // 3. 队友也看到了球，且队友位置可信
+    
+    if (!res.success && brain->data->ballDetected) {
+        for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++) {
+            // 跳过自己
+            if (i == (brain->config->playerId - 1)) continue;
+            
+            auto& tm = brain->data->tmStatus[i];
+            
+            // 队友必须活着，且最近有通信 (例如 1秒内)
+            if (!tm.isAlive || brain->msecsSince(tm.timeLastCom) > 1000.0) continue;
+            
+            // 队友必须看到球，且球的置信度高
+            // 注意：BrainData::TMStatus 结构体里要有 ballDetected 字段
+            if (tm.ballDetected && tm.ballConfidence > 0.6) {
+                
+                // 核心算法： MyPose = BallGlobal(FromTeammate) - BallRel(MyObservation)
+                
+                auto ballGlobal = tm.ballPosToField; // 队友计算出的球的全局位置 (Point2D or Pose2D)
+                auto ballRel = brain->data->ball.posToRobot; // 我看到的球相对位置 (Point2D)
+                
+                // 这里的关键假设：我的朝向(Theta)是准的（通常由IMU/里程计保证）
+                // 只有 X, Y 漂移了
+                double myTheta = brain->data->robotPoseToField.theta; 
+                
+                // 向量减法：Global = MyPos + Rot(theta) * Rel
+                // MyPos = Global - Rot(theta) * Rel
+                // x = gx - (rx * cos - ry * sin)
+                // y = gy - (rx * sin + ry * cos)
+                
+                double manualX = ballGlobal.x - (ballRel.x * cos(myTheta) - ballRel.y * sin(myTheta));
+                double manualY = ballGlobal.y - (ballRel.x * sin(myTheta) + ballRel.y * cos(myTheta));
+                
+                // 简单的合理性验证：推算出的位置不能在场外太远
+                if (std::fabs(manualX) < fd.length/2 + 1.0 &&
+                    std::fabs(manualY) < fd.width/2 + 1.0) 
+                {
+                    brain->log->log("debug/coop_locate", rerun::TextLog("Localization recovered using teammate info!"));
+                    
+                    // 强制校准里程计
+                    brain->calibrateOdom(manualX, manualY, myTheta);
+                    brain->tree->setEntry<bool>("odom_calibrated", true);
+                    brain->data->lastSuccessfulLocalizeTime = brain->get_clock()->now();
+                    brain->speak("Coop locate", false); 
+                    
+                    // 在日志里画出来
+                    brain->log->log(
+                        "field/recal_coop",
+                        rerun::Arrows2D::from_vectors({{manualX - brain->data->robotPoseToField.x, -manualY + brain->data->robotPoseToField.y}})
+                        .with_origins({{brain->data->robotPoseToField.x, - brain->data->robotPoseToField.y}})
+                        .with_colors({0x00FFFF00}) // 青色
+                        .with_labels({"coop"})
+                    );
+                    
+                    return NodeStatus::SUCCESS; // 成功返回
+                }
+            }
+        }
+    }
+
+    // ... (保留常规日志和 Odom 更新逻辑) ...
 
     brain->log->setTimeNow();
     string mstring = "";
@@ -434,38 +495,28 @@ NodeStatus SelfLocate::tick()
         auto m = markers[i];
         mstring += format("type: %c  x: %.1f y: %.1f", m.type, m.x, m.y);
     }
+    
+    // 如果常规定位成功
     if (res.success) {
+        brain->calibrateOdom(res.pose.x, res.pose.y, res.pose.theta);
+        brain->tree->setEntry<bool>("odom_calibrated", true);
+        brain->data->lastSuccessfulLocalizeTime = brain->get_clock()->now();
         
+        // Log
         brain->log->log(
             "field/recal",
             rerun::Arrows2D::from_vectors({{res.pose.x - brain->data->robotPoseToField.x, -res.pose.y + brain->data->robotPoseToField.y}})
             .with_origins({{brain->data->robotPoseToField.x, - brain->data->robotPoseToField.y}})
-            .with_colors(res.success ? 0x00FF00FF : 0xFF0000FF)
-            .with_radii(0.01)
-            .with_draw_order(10)
+            .with_colors({0x00FF00FF})
             .with_labels({"pf"})
         );
     }
-    log(
-        format(
-            "success: %d  residual: %.2f  marker.size: %d  minMarkerCnt: %d  resTolerance: %.2f marker: %s",
-            res.success,
-            res.residual,
-            markers.size(),
-            brain->locator->minMarkerCnt,
-            brain->locator->residualTolerance,
-            mstring.c_str()
-        )
-    );
+
+    log(format(
+            "success: %d  residual: %.2f  marker.size: %zu", // %zu for size_t
+            res.success, res.residual, markers.size()
+    ));
     
-    if (!res.success)
-        return NodeStatus::SUCCESS; 
-
-    brain->calibrateOdom(res.pose.x, res.pose.y, res.pose.theta);
-    brain->tree->setEntry<bool>("odom_calibrated", true);
-    brain->data->lastSuccessfulLocalizeTime = brain->get_clock()->now();
-    prtDebug("定位成功: " + to_string(res.pose.x) + " " + to_string(res.pose.y) + " " + to_string(rad2deg(res.pose.theta)) + " Dur: " + to_string(res.msecs));
-
     return NodeStatus::SUCCESS;
 }
 

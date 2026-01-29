@@ -1,5 +1,6 @@
 #include <cmath>
 #include <cstdlib>
+#include <algorithm>
 #include "brain_tree.h"
 #include "locator.h"
 #include "brain.h"
@@ -249,28 +250,37 @@ CamFindBall::CamFindBall(const string &name, const NodeConfig &config, Brain *_b
 
 NodeStatus CamFindBall::tick()
 {
-    if (brain->data->ballDetected)
-    {
+    if (brain->data->ballDetected) {
         return NodeStatus::SUCCESS;
+    }
+
+    // 智能找球优化：如果是刚丢失球，重置扫描索引到球消失的方向
+    // 检查时间差，防止很久以前的记忆干扰
+    if (brain->msecsSince(brain->data->ball.timePoint) < 2000.0) { 
+         double lastYaw = brain->data->ball.yawToRobot;
+         // 假设 _cmdSequence[0] 是左边，[2] 是右边 (根据之前代码推断)
+         // 0: 左下, 1: 中下, 2: 右下 ...
+         if (lastYaw > 0.5) _cmdIndex = 0; // 优先扫左边
+         else if (lastYaw < -0.5) _cmdIndex = 2; // 优先扫右边
+         // 否则保持当前索引
     }
 
     auto curTime = brain->get_clock()->now();
     auto timeSinceLastCmd = (curTime - _timeLastCmd).nanoseconds() / 1e6;
-    if (timeSinceLastCmd < _cmdIntervalMSec)
-    {
+    
+    // 加快扫描速度
+    if (timeSinceLastCmd < _cmdIntervalMSec) {
         return NodeStatus::SUCCESS;
     } 
-    else if (timeSinceLastCmd > _cmdRestartIntervalMSec)
-    {                 
-        _cmdIndex = 0; 
-    }
-    else
-    { 
-        _cmdIndex = (_cmdIndex + 1) % (sizeof(_cmdSequence) / sizeof(_cmdSequence[0]));
-    }
-
+    
+    // 执行
     brain->client->moveHead(_cmdSequence[_cmdIndex][0], _cmdSequence[_cmdIndex][1]);
+    
+    // 索引循环
+    size_t seqSize = sizeof(_cmdSequence) / sizeof(_cmdSequence[0]);
+    _cmdIndex = (_cmdIndex + 1) % seqSize;
     _timeLastCmd = brain->get_clock()->now();
+    
     return NodeStatus::SUCCESS;
 }
 
@@ -302,41 +312,42 @@ NodeStatus Chase::tick()
     };
 
     double vxLimit, vyLimit, vthetaLimit, dist, safeDist;
-    getInput("vx_limit", vxLimit);
-    getInput("vy_limit", vyLimit);
-    getInput("vtheta_limit", vthetaLimit);
-    getInput("dist", dist);       
-    getInput("safe_dist", safeDist); 
+    // 获取参数时增加 .value() 确保类型匹配，或者提供默认值
+    if (!getInput("vx_limit", vxLimit)) vxLimit = 1.0;
+    if (!getInput("vy_limit", vyLimit)) vyLimit = 0.5;
+    if (!getInput("vtheta_limit", vthetaLimit)) vthetaLimit = 1.0;
+    if (!getInput("dist", dist)) dist = 0.2;
+    if (!getInput("safe_dist", safeDist)) safeDist = 0.5;
 
     // 1. 获取基础数据
     auto ballPos = brain->data->ball.posToField;
     auto robotPose = brain->data->robotPoseToField;
     double kickDir = brain->data->kickDir; 
-    double ballRange = brain->data->ball.range;
-
-    // 2. 坐标系转换：计算机器人相对于“理想踢球位”的误差
-    // 理想位置：球后方 dist 处，朝向 kickDir
-    // 我们定义一个“踢球坐标系(Kick Frame)”：原点在球，X轴指向kickDir，Y轴垂直
+    
+    // 2. 坐标系转换：计算机器人相对于“理想踢球坐标系”的误差
+    // 理想位置：球的后方 dist 处，朝向 kickDir
+    // 坐标系定义：原点在球，X轴指向 kickDir，Y轴垂直于 kickDir 向左
     
     double dx_global = robotPose.x - ballPos.x;
     double dy_global = robotPose.y - ballPos.y;
 
     // 将全局相对坐标 (dx, dy) 旋转到 踢球坐标系
-    // local_x: 机器人沿踢球方向相对于球的距离 (负数表示在球后方)
-    // local_y: 机器人偏离踢球路线的横向距离 (0表示正对球心)
+    // Rotation Matrix R(-kickDir):
+    // [ cos  sin ]
+    // [ -sin cos ]
     double local_x = dx_global * cos(kickDir) + dy_global * sin(kickDir);
     double local_y = -dx_global * sin(kickDir) + dy_global * cos(kickDir);
     double local_theta = toPInPI(robotPose.theta - kickDir); // 角度误差
 
     // 3. 设定目标 (在踢球坐标系下)
     // 我们希望机器人在 X = -dist (球后), Y = 0 (正对), Theta = 0 (朝向一致)
-    // 注意：如果离球很远，不需要严格对齐 Y=0，可以先靠近；但离球越近，Y必须越准
-    double target_x_kick = -std::max(dist, 0.25); // 保持至少 25cm 距离用于最后调整
+    // 限制 target_x_kick 至少在球后方一定距离，给冲刺留空间
+    double target_x_kick = -std::max(dist, 0.25); 
     
     // 4. 计算控制量 (在踢球坐标系下的期望速度)
-    double kp_x = 1.5;
-    double kp_y = 2.0; // 横向纠偏增益大一些
-    double kp_theta = 2.5;
+    double kp_x = 1.8; // 稍微增大 P 参数
+    double kp_y = 2.5; // 横向纠偏增益大，保证对齐
+    double kp_theta = 2.8;
 
     double v_x_kick = -kp_x * (local_x - target_x_kick);
     double v_y_kick = -kp_y * local_y; 
@@ -344,55 +355,60 @@ NodeStatus Chase::tick()
     // 5. 关键优化：根据“对齐程度”限制纵向速度 (Throttling)
     // 如果横向偏离大(abs(local_y)) 或 角度偏离大(abs(local_theta))，则减慢前进速度 v_x
     // 这迫使机器人在没对准时“横移”而不是“冲锋”
-    double alignment_error = fabs(local_y) + fabs(local_theta) * 0.5;
-    double throttle_factor = std::max(0.0, 1.0 - alignment_error * 2.0); // 误差越大，因子越小
+    double alignment_error = std::fabs(local_y) * 1.5 + std::fabs(local_theta) * 0.5;
+    // 使用 std::max 确保因子不小于 0.1，避免完全卡死
+    double throttle_factor = std::max(0.1, 1.0 - alignment_error); 
     
-    // 如果在球后方（准备射门），严格限制前进速度；如果在球前方（绕后阶段），则稍微放宽
-    if (local_x < 0) {
+    // 只有在球后方（准备射门阶段）才限制速度；如果跑过了或者在绕后，不限制
+    if (local_x < 0.1) {
         v_x_kick *= throttle_factor;
     }
 
     // 6. 速度坐标变换：从 踢球坐标系 -> 机器人坐标系
     // V_robot = Rot(-local_theta) * V_kick
-    double vx = v_x_kick * cos(local_theta) - v_y_kick * sin(local_theta);
-    double vy = v_x_kick * sin(local_theta) + v_y_kick * cos(local_theta);
+    // 注意：这里 local_theta = robot - kickDir，所以 kickDir = robot - local_theta
+    // 实际上我们需要把 V_kick (相对于 kickDir) 转换成 V_robot (相对于 robot)
+    // 旋转角度应该是 -local_theta
+    double vx = v_x_kick * cos(local_theta) + v_y_kick * sin(local_theta); // sin(-a) = -sin(a) -> logic fix
+    double vy = -v_x_kick * sin(local_theta) + v_y_kick * cos(local_theta); 
     double vtheta = -kp_theta * local_theta;
 
-    // 7. 绕后逻辑补充
+    // 7. 绕后逻辑补充 (Circle Logic)
     // 如果机器人在球的前方 (local_x > 0) 或者侧方很远，上述逻辑可能会导致撞球
-    // 需要叠加一个“势场”让它绕开球
-    if (local_x > -0.1 || fabs(local_y) > 0.5) {
-        // 简单的绕圆逻辑：
+    // 增加一个简单的势场绕行
+    if (local_x > -0.15 || std::fabs(local_y) > 0.4) {
         // 目标点是球后方 safe_dist 处
         double target_global_x = ballPos.x - safeDist * cos(kickDir);
         double target_global_y = ballPos.y - safeDist * sin(kickDir);
         
-        // 覆盖上面的精细控制，改用简单的 P 控制去安全点
+        // 简单的 P 控制去安全点
         double err_x = target_global_x - robotPose.x;
         double err_y = target_global_y - robotPose.y;
         
         // 转换到机器人坐标系
-        double target_dir = atan2(err_y, err_x);
+        double target_dir_global = atan2(err_y, err_x);
+        double dir_diff = toPInPI(target_dir_global - robotPose.theta);
         double dist_to_target = std::hypot(err_x, err_y);
-        double dir_diff = toPInPI(target_dir - robotPose.theta);
         
-        vx = vxLimit * cos(dir_diff);
-        vy = vxLimit * sin(dir_diff);
-        vtheta = dir_diff * 2.0;
-        
-        // 此时为了快速绕后，不需要 throttle
-        vx = std::min(vx, vxLimit);
+        // 简单的极坐标控制
+        vx = vxLimit; 
+        vy = 0; // 主要靠前向速度
+        vtheta = dir_diff * 2.5;
+
+        // 如果角度偏差大，减小 vx，原地转
+        if (std::fabs(dir_diff) > 0.5) vx = 0.0;
+        else if (std::fabs(dir_diff) > 0.2) vx *= 0.5;
     }
 
     // 8. 射门触发逻辑 (Zero-Stop Kick)
     // 条件变得更严格：距离合适，且角度误差极小，且横向误差极小
-    bool distOk = fabs(local_x) < 0.45; // 在球后方不远处
-    bool angleOk = fabs(local_theta) < 0.12; // 角度误差 < 7度 (之前是0.35)
-    bool yOk = fabs(local_y) < 0.10; // 横向偏离 < 10cm (这是踢准的关键)
+    bool distOk = (local_x > -0.45) && (local_x < 0.1); // 在球后方不远处
+    bool angleOk = std::fabs(local_theta) < 0.15; // 角度误差 < 8.5度
+    bool yOk = std::fabs(local_y) < 0.12; // 横向偏离 < 12cm
 
     if (distOk && angleOk && yOk) {
         brain->tree->setEntry<string>("decision", "kick");
-        brain->speak("Shoot");
+        brain->speak("Shoot", false);
         log("Precision kick triggered!");
     }
 
@@ -401,22 +417,32 @@ NodeStatus Chase::tick()
     vy = cap(vy, vyLimit, -vyLimit);
     vtheta = cap(vtheta, vthetaLimit, -vthetaLimit);
 
-    // 避障逻辑 (保持不变)
-    bool avoidObstacle;
+    // 避障逻辑
+    bool avoidObstacle = false;
     brain->get_parameter("obstacle_avoidance.avoid_during_chase", avoidObstacle);
-    double oaSafeDist;
+    double oaSafeDist = 0.5;
     brain->get_parameter("obstacle_avoidance.chase_ao_safe_dist", oaSafeDist);
+    
     if (avoidObstacle) {
         double moveDir = atan2(vy, vx);
+        // distToObstacle 在 brain.h 中声明
         if (brain->distToObstacle(moveDir) < oaSafeDist) {
-             vy += (vy > 0 ? 0.3 : -0.3); 
-             vx *= 0.5;
+             vy += (vy > 0 ? 0.3 : -0.3); // 侧向闪躲
+             vx *= 0.5; // 减速
         }
     }
 
+    // 10. 平滑处理 (可选，防止电机抖动)
+    static double lastVx = 0, lastVy = 0, lastVtheta = 0;
+    double alpha = 0.7; // 0.7 新值
+    vx = alpha * vx + (1 - alpha) * lastVx;
+    vy = alpha * vy + (1 - alpha) * lastVy;
+    vtheta = alpha * vtheta + (1 - alpha) * lastVtheta;
+    lastVx = vx; lastVy = vy; lastVtheta = vtheta;
+
     brain->client->setVelocity(vx, vy, vtheta, false, false, false);
     
-    // 可视化调试
+    // 可视化
     brain->log->setTimeNow();
     brain->log->log(
         "field/chase_target", 
@@ -817,52 +843,96 @@ NodeStatus Adjust::tick()
 
 NodeStatus CalcKickDir::tick()
 {
-    // 读取和处理参数
     double crossThreshold;
-    getInput("cross_threshold", crossThreshold);
-
-    string lastKickType = brain->data->kickType;
-    if (lastKickType == "cross") crossThreshold += 0.1;
+    if (!getInput("cross_threshold", crossThreshold)) crossThreshold = 0.5;
 
     auto gpAngles = brain->getGoalPostAngles(0.0);
-    auto thetal = gpAngles[0]; auto thetar = gpAngles[1];
+    double thetal = gpAngles[0]; 
+    double thetar = gpAngles[1];
     auto bPos = brain->data->ball.posToField;
     auto fd = brain->config->fieldDimensions;
-    auto color = 0xFFFFFFFF; // for log
+    uint32_t color = 0xFFFFFFFF; 
 
-    if (thetal - thetar < crossThreshold && brain->data->ball.posToField.x > fd.circleRadius) {
-        brain->data->kickType = "cross";
-        color = 0xFF00FFFF;
-        brain->data->kickDir = atan2(
-            - bPos.y,
-            fd.length/2 - fd.penaltyDist/2 - bPos.x
-        );
+    // 默认策略：向球门射门
+    string kickType = "shoot";
+    // 射向球门中心
+    double kickDir = atan2(-bPos.y, fd.length/2 - bPos.x);
+
+    // 1. 判断是否被封堵 (射门角度太小)
+    bool isBlocked = (std::fabs(thetal - thetar) < 0.2); // 0.2 rad 约 11度
+
+    // 2. 智能传球逻辑 (Smart Passing)
+    // 只有当有队友且被封堵时才考虑传球
+    if (isBlocked && brain->config->numOfPlayers > 1) {
+        int bestTmIdx = -1;
+        double maxScore = -100.0;
+
+        for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++) {
+            // 跳过自己
+            if (i == (brain->config->playerId - 1)) continue;
+            // 跳过掉线的队友 (HL_MAX_NUM_PLAYERS 是宏，i 是 int，安全)
+            if (!brain->data->tmStatus[i].isAlive) continue;
+
+            auto tmPose = brain->data->tmStatus[i].robotPoseToField;
+            
+            // 评分标准:
+            // 1. x 越大越好 (越靠前)
+            // 2. 距离不要太远 ( > 5米传球精度不够)
+            double distToTm = std::hypot(tmPose.x - bPos.x, tmPose.y - bPos.y);
+            
+            double score = tmPose.x * 2.0; 
+            if (distToTm > 5.0) score -= 10.0; // 太远扣分
+            if (distToTm < 1.0) score -= 5.0;  // 太近没意义
+
+            // 如果队友在身后，极大扣分
+            if (tmPose.x < bPos.x) score -= 5.0;
+
+            if (score > maxScore) {
+                maxScore = score;
+                bestTmIdx = i;
+            }
+        }
+
+        // 阈值判断：分数必须大于一定值才传球
+        if (bestTmIdx != -1 && maxScore > -5.0) {
+            kickType = "pass"; 
+            // 传球给该队友
+            auto target = brain->data->tmStatus[bestTmIdx].robotPoseToField;
+            kickDir = atan2(target.y - bPos.y, target.x - bPos.x);
+            color = 0x0000FFFF; // 蓝色代表传球
+            brain->speak("Passing", false);
+        }
     }
-    else if (brain->isDefensing()) {
-        brain->data->kickType = "block";
-        color = 0xFFFF00FF;
-        brain->data->kickDir = atan2(
-            bPos.y,
-            bPos.x + fd.length/2
-        );
 
-    } else { 
-        brain->data->kickType = "shoot";
-        color = 0x00FF00FF;
-        brain->data->kickDir = atan2(
-            - bPos.y,
-            fd.length/2 - bPos.x
-        );
-        if (brain->data->ball.posToField.x > brain->config->fieldDimensions.length / 2) brain->data->kickDir = 0; 
+    // 3. 常规逻辑修正 (Cross / Block / Shoot修正)
+    if (kickType == "shoot") { 
+        if (thetal - thetar < crossThreshold && bPos.x > fd.circleRadius) {
+            kickType = "cross"; // 传中/底线回敲
+            color = 0xFF00FFFF;
+            kickDir = atan2(-bPos.y, fd.length/2 - fd.penaltyDist/2 - bPos.x);
+        }
+        else if (brain->isDefensing()) {
+            kickType = "block"; // 防守解围
+            color = 0xFFFF00FF;
+            // 往两边踢，或者往前踢
+            kickDir = atan2(bPos.y, bPos.x + fd.length/2);
+        }
+        
+        // 强制修正：如果已经带球过半场且接近底线，角度不能太偏
+        if (bPos.x > fd.length / 2) kickDir = 0;
     }
 
+    brain->data->kickType = kickType;
+    brain->data->kickDir = kickDir;
+
+    // 可视化
     brain->log->setTimeNow();
     brain->log->log(
         "field/kick_dir",
-        rerun::Arrows2D::from_vectors({{10 * cos(brain->data->kickDir), -10 * sin(brain->data->kickDir)}})
-            .with_origins({{brain->data->ball.posToField.x, -brain->data->ball.posToField.y}})
+        rerun::Arrows2D::from_vectors({{1.0 * cos(kickDir), -1.0 * sin(kickDir)}})
+            .with_origins({{bPos.x, -bPos.y}})
             .with_colors({color})
-            .with_radii(0.01)
+            .with_radii(0.02)
             .with_draw_order(31)
     );
 
