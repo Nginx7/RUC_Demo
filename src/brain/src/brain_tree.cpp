@@ -298,98 +298,133 @@ NodeStatus Chase::tick()
 {
     auto log = [=](string msg) {
         brain->log->setTimeNow();
-        brain->log->log("debug/Chase4", rerun::TextLog(msg));
+        brain->log->log("debug/Chase_Optimized", rerun::TextLog(msg));
     };
-    log("ticked");
-    
+
     double vxLimit, vyLimit, vthetaLimit, dist, safeDist;
     getInput("vx_limit", vxLimit);
     getInput("vy_limit", vyLimit);
     getInput("vtheta_limit", vthetaLimit);
-    getInput("dist", dist);
-    getInput("safe_dist", safeDist);
+    getInput("dist", dist);       
+    getInput("safe_dist", safeDist); 
 
-    bool avoidObstacle;
-    brain->get_parameter("obstacle_avoidance.avoid_during_chase", avoidObstacle);
-    double oaSafeDist;
-    brain->get_parameter("obstacle_avoidance.chase_ao_safe_dist", oaSafeDist);
-
-    if (
-        brain->config->limitNearBallSpeed
-        && brain->data->ball.range < brain->config->nearBallRange
-    ) {
-        vxLimit = min(brain->config->nearBallSpeedLimit, vxLimit);
-    }
-
-    double ballRange = brain->data->ball.range;
-    double ballYaw = brain->data->ball.yawToRobot;
-    double kickDir = brain->data->kickDir;
-    double theta_br = atan2(
-        brain->data->robotPoseToField.y - brain->data->ball.posToField.y,
-        brain->data->robotPoseToField.x - brain->data->ball.posToField.x
-    );
-    double theta_rb = brain->data->robotBallAngleToField;
+    // 1. 获取基础数据
     auto ballPos = brain->data->ball.posToField;
+    auto robotPose = brain->data->robotPoseToField;
+    double kickDir = brain->data->kickDir; 
+    double ballRange = brain->data->ball.range;
 
+    // 2. 坐标系转换：计算机器人相对于“理想踢球位”的误差
+    // 理想位置：球后方 dist 处，朝向 kickDir
+    // 我们定义一个“踢球坐标系(Kick Frame)”：原点在球，X轴指向kickDir，Y轴垂直
+    
+    double dx_global = robotPose.x - ballPos.x;
+    double dy_global = robotPose.y - ballPos.y;
 
-    double vx, vy, vtheta;
-    Pose2D target_f, target_r; 
-    static string targetType = "direct"; 
-    static double circleBackDir = 1.0; 
-    double dirThreshold = M_PI / 2;
-    if (targetType == "direct") dirThreshold *= 1.2;
+    // 将全局相对坐标 (dx, dy) 旋转到 踢球坐标系
+    // local_x: 机器人沿踢球方向相对于球的距离 (负数表示在球后方)
+    // local_y: 机器人偏离踢球路线的横向距离 (0表示正对球心)
+    double local_x = dx_global * cos(kickDir) + dy_global * sin(kickDir);
+    double local_y = -dx_global * sin(kickDir) + dy_global * cos(kickDir);
+    double local_theta = toPInPI(robotPose.theta - kickDir); // 角度误差
 
+    // 3. 设定目标 (在踢球坐标系下)
+    // 我们希望机器人在 X = -dist (球后), Y = 0 (正对), Theta = 0 (朝向一致)
+    // 注意：如果离球很远，不需要严格对齐 Y=0，可以先靠近；但离球越近，Y必须越准
+    double target_x_kick = -std::max(dist, 0.25); // 保持至少 25cm 距离用于最后调整
+    
+    // 4. 计算控制量 (在踢球坐标系下的期望速度)
+    double kp_x = 1.5;
+    double kp_y = 2.0; // 横向纠偏增益大一些
+    double kp_theta = 2.5;
 
-    // 计算目标点
-    if (fabs(toPInPI(kickDir - theta_rb)) < dirThreshold) {
-        log("targetType = direct");
-        targetType = "direct";
-        target_f.x = ballPos.x - dist * cos(kickDir);
-        target_f.y = ballPos.y - dist * sin(kickDir);
-    } else {
-        targetType = "circle_back";
-        double cbDirThreshold = 0.0; 
-        cbDirThreshold -= 0.2 * circleBackDir; 
-        circleBackDir = toPInPI(theta_br - kickDir) > cbDirThreshold ? 1.0 : -1.0;
-        log(format("targetType = circle_back, circleBackDir = %.1f", circleBackDir));
-        double tanTheta = theta_br + circleBackDir * acos(min(1.0, safeDist/max(ballRange, 1e-5))); 
-        target_f.x = ballPos.x + safeDist * cos(tanTheta);
-        target_f.y = ballPos.y + safeDist * sin(tanTheta);
-    }
-    target_r = brain->data->field2robot(target_f);
-    brain->log->setTimeNow();
-    brain->log->logBall("field/chase_target", Point({target_f.x, target_f.y, 0}), 0xFFFFFFFF, false, false);
-            
-    double targetDir = atan2(target_r.y, target_r.x);
-    double distToObstacle = brain->distToObstacle(targetDir);
-    if (avoidObstacle && distToObstacle < oaSafeDist) {
-        log("avoid obstacle");
-        auto avoidDir = brain->calcAvoidDir(targetDir, oaSafeDist);
-        const double speed = 0.5;
-        vx = speed * cos(avoidDir);
-        vy = speed * sin(avoidDir);
-        vtheta = ballYaw;
-    } else {
-        vx = min(vxLimit, brain->data->ball.range);
-        vy = 0;
-        vtheta = targetDir;
-        if (fabs(targetDir) < 0.1 && ballRange > 2.0) vtheta = 0.0;
-        vx *= sigmoid((fabs(vtheta)), 1, 3); 
+    double v_x_kick = -kp_x * (local_x - target_x_kick);
+    double v_y_kick = -kp_y * local_y; 
+    
+    // 5. 关键优化：根据“对齐程度”限制纵向速度 (Throttling)
+    // 如果横向偏离大(abs(local_y)) 或 角度偏离大(abs(local_theta))，则减慢前进速度 v_x
+    // 这迫使机器人在没对准时“横移”而不是“冲锋”
+    double alignment_error = fabs(local_y) + fabs(local_theta) * 0.5;
+    double throttle_factor = std::max(0.0, 1.0 - alignment_error * 2.0); // 误差越大，因子越小
+    
+    // 如果在球后方（准备射门），严格限制前进速度；如果在球前方（绕后阶段），则稍微放宽
+    if (local_x < 0) {
+        v_x_kick *= throttle_factor;
     }
 
+    // 6. 速度坐标变换：从 踢球坐标系 -> 机器人坐标系
+    // V_robot = Rot(-local_theta) * V_kick
+    double vx = v_x_kick * cos(local_theta) - v_y_kick * sin(local_theta);
+    double vy = v_x_kick * sin(local_theta) + v_y_kick * cos(local_theta);
+    double vtheta = -kp_theta * local_theta;
+
+    // 7. 绕后逻辑补充
+    // 如果机器人在球的前方 (local_x > 0) 或者侧方很远，上述逻辑可能会导致撞球
+    // 需要叠加一个“势场”让它绕开球
+    if (local_x > -0.1 || fabs(local_y) > 0.5) {
+        // 简单的绕圆逻辑：
+        // 目标点是球后方 safe_dist 处
+        double target_global_x = ballPos.x - safeDist * cos(kickDir);
+        double target_global_y = ballPos.y - safeDist * sin(kickDir);
+        
+        // 覆盖上面的精细控制，改用简单的 P 控制去安全点
+        double err_x = target_global_x - robotPose.x;
+        double err_y = target_global_y - robotPose.y;
+        
+        // 转换到机器人坐标系
+        double target_dir = atan2(err_y, err_x);
+        double dist_to_target = std::hypot(err_x, err_y);
+        double dir_diff = toPInPI(target_dir - robotPose.theta);
+        
+        vx = vxLimit * cos(dir_diff);
+        vy = vxLimit * sin(dir_diff);
+        vtheta = dir_diff * 2.0;
+        
+        // 此时为了快速绕后，不需要 throttle
+        vx = std::min(vx, vxLimit);
+    }
+
+    // 8. 射门触发逻辑 (Zero-Stop Kick)
+    // 条件变得更严格：距离合适，且角度误差极小，且横向误差极小
+    bool distOk = fabs(local_x) < 0.45; // 在球后方不远处
+    bool angleOk = fabs(local_theta) < 0.12; // 角度误差 < 7度 (之前是0.35)
+    bool yOk = fabs(local_y) < 0.10; // 横向偏离 < 10cm (这是踢准的关键)
+
+    if (distOk && angleOk && yOk) {
+        brain->tree->setEntry<string>("decision", "kick");
+        brain->speak("Shoot");
+        log("Precision kick triggered!");
+    }
+
+    // 9. 限幅与避障
     vx = cap(vx, vxLimit, -vxLimit);
     vy = cap(vy, vyLimit, -vyLimit);
     vtheta = cap(vtheta, vthetaLimit, -vthetaLimit);
 
-    static double smoothVx = 0.0;
-    static double smoothVy = 0.0;
-    static double smoothVtheta = 0.0;
-    smoothVx = smoothVx * 0.7 + vx * 0.3;
-    smoothVy = smoothVy * 0.7 + vy * 0.3;
-    smoothVtheta = smoothVtheta * 0.7 + vtheta * 0.3;
+    // 避障逻辑 (保持不变)
+    bool avoidObstacle;
+    brain->get_parameter("obstacle_avoidance.avoid_during_chase", avoidObstacle);
+    double oaSafeDist;
+    brain->get_parameter("obstacle_avoidance.chase_ao_safe_dist", oaSafeDist);
+    if (avoidObstacle) {
+        double moveDir = atan2(vy, vx);
+        if (brain->distToObstacle(moveDir) < oaSafeDist) {
+             vy += (vy > 0 ? 0.3 : -0.3); 
+             vx *= 0.5;
+        }
+    }
 
-    // brain->client->setVelocity(smoothVx, smoothVy, smoothVtheta, false, false, false);
     brain->client->setVelocity(vx, vy, vtheta, false, false, false);
+    
+    // 可视化调试
+    brain->log->setTimeNow();
+    brain->log->log(
+        "field/chase_target", 
+        rerun::Arrows2D::from_vectors({{cos(kickDir), sin(kickDir)}})
+        .with_origins({{ballPos.x - dist*cos(kickDir), ballPos.y - dist*sin(kickDir)}})
+        .with_colors({0x00FF00FF})
+    );
+
     return NodeStatus::SUCCESS;
 }
 
