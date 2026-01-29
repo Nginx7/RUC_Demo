@@ -11,18 +11,18 @@ brain_node:
     robot:
       robot_height: 1.0 
       odom_factor: 1.2 
-      vx_factor: 0.50 
+      vx_factor: 0.80 #0.50 
       yaw_offset: 0.0 
-      vx_limit: 1.0 
-      vy_limit: 0.4
-      vtheta_limit: 1.2 
+      vx_limit: 2.5 # 1.0
+      vy_limit: 0.8 # 0.4
+      vtheta_limit: 1.5 # 1.2 
 
     strategy:
-      ball_confidence_threshold: 50.0 
+      ball_confidence_threshold: 60.0 
       ball_memory_timeout: 5.0 
       tm_ball_dist_threshold: 2.0 
       limit_near_ball_speed: false 
-      near_ball_speed_limit: 0.2 
+      near_ball_speed_limit: 0.4 # 0.2
       near_ball_range: 3.0
       abort_kick_when_ball_moved: true 
       cooperation: 
@@ -39,9 +39,9 @@ brain_node:
       exclusion_y: 0.4 
       ball_exclusion_radius: 0.0 
       ball_exclusion_height: 0.3 
-      occupancy_threshold: 1 
-      collision_threshold: 0.3 
-      safe_distance: 2.0 
+      occupancy_threshold: 5 # 1
+      collision_threshold: 0.6 # 0.3 
+      safe_distance: 0.5 #2.0 
       avoid_secs: 3.0 
       enable_freekick_avoid: false 
       freekick_start_placing_safe_distance: 0.1 
@@ -50,7 +50,7 @@ brain_node:
       avoid_during_kick: false 
       kick_ao_safe_dist: 3.0 
       kick_ao_use_shoot: false 
-      avoid_during_chase: true 
+      avoid_during_chase: false #true 
       chase_ao_safe_dist: 3.5 
 
     locator:
