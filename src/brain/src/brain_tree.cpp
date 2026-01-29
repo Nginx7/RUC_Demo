@@ -618,14 +618,10 @@ void GoToFreekickPosition::onHalted() {
 
 NodeStatus GoToGoalBlockingPosition::tick() {
     auto log = [=](string msg) {
-        // brain->log->setTimeNow();
-        // brain->log->log("debug/GoToGoalBlockingPosition", rerun::TextLog(msg));
+        brain->log->setTimeNow();
+        brain->log->log("debug/Goalie_Predict", rerun::TextLog(msg));
     };
-    log("GoToGoalBlockingPosition ticked");
 
-    // brain->log->setTimeNow();
-    // brain->log->log("tree/GoToGoalBlockingPosition", rerun::TextLog("GoToGoalBlockingPosition tick"));
-    
     double distTolerance = getInput<double>("dist_tolerance").value();
     double thetaTolerance = getInput<double>("theta_tolerance").value();
     double distToGoalline = getInput<double>("dist_to_goalline").value();
@@ -634,43 +630,72 @@ NodeStatus GoToGoalBlockingPosition::tick() {
     auto ballPos = brain->data->ball.posToField;
     auto robotPose = brain->data->robotPoseToField;
 
-    string curRole = brain->tree->getEntry<string>("player_role");
+    // 1. 计算目标 X 坐标 (站在球门线上前方一点)
+    // 守门员通常站在 -Length/2 + 0.5m 处
+    double targetX = -fd.length / 2.0 + distToGoalline;
 
-    Pose2D targetPose;
-    targetPose.x = curRole == "striker" ? (std::max(- fd.length / 2.0 + distToGoalline, ballPos.x - 1.5))
-            : (- fd.length / 2.0 + distToGoalline);
-    if (ballPos.x + fd.length / 2.0 < distToGoalline) {
-        targetPose.y = curRole == "striker" ? (ballPos.y > 0 ? fd.goalWidth / 2.0 : -fd.goalWidth / 2.0)
-            : (ballPos.y > 0 ? fd.goalWidth / 4.0 : -fd.goalWidth / 4.0);
-    } else {
-        targetPose.y = ballPos.y * distToGoalline / (ballPos.x + fd.length / 2.0);
-        targetPose.y = curRole == "striker" ? (cap(targetPose.y, fd.goalWidth / 2.0, -fd.goalWidth / 2.0))
-            : (cap(targetPose.y, fd.penaltyAreaWidth/ 2.0, -fd.penaltyAreaWidth / 2.0));
+    // 2. 速度估计与轨迹预测 (核心优化)
+    static Point2D lastBallPos = {0,0};
+    static rclcpp::Time lastTime = brain->get_clock()->now();
+    auto now = brain->get_clock()->now();
+    double dt = (now - lastTime).seconds();
+    
+    double predY = ballPos.y; // 默认：球当前的Y
+
+    // 只有当 dt 合理且球在移动时才预测
+    if (dt > 0.05 && dt < 1.0) {
+        double vx = (ballPos.x - lastBallPos.x) / dt;
+        double vy = (ballPos.y - lastBallPos.y) / dt;
+        
+        // 只有球向我方球门移动 (vx < 0) 且速度够快时才预测
+        if (vx < -0.2) {
+            // 计算球到达球门线的时间
+            double timeToGoal = (targetX - ballPos.x) / vx;
+            
+            // 限制预测时间在未来 2秒内，太远就不准了
+            if (timeToGoal > 0 && timeToGoal < 2.0) {
+                predY = ballPos.y + vy * timeToGoal;
+                log(format("Predicting save at Y=%.2f (t=%.2fs)", predY, timeToGoal));
+            }
+        }
+    }
+    
+    // 更新历史数据
+    if (dt > 0.05) {
+        lastBallPos = ballPos;
+        lastTime = now;
     }
 
+    // 3. 目标 Y 坐标 (限制在球门范围内)
+    // 稍微收缩防守范围，防止撞柱子
+    double maxY = fd.goalWidth / 2.0 - 0.2;
+    double targetY = cap(predY, maxY, -maxY);
+
+    Pose2D targetPose{targetX, targetY, 0.0};
+    
+    // 守门员始终朝向球
+    double targetTheta = atan2(ballPos.y - robotPose.y, ballPos.x - robotPose.x);
+    
+    // 4. 移动控制
     double dist = norm(targetPose.x - robotPose.x, targetPose.y - robotPose.y);
-    if ( // 认为到达了目标位置
-        dist < distTolerance
-        && fabs(brain->data->ball.yawToRobot) < thetaTolerance
-    ) {
+    if (dist < distTolerance && fabs(toPInPI(robotPose.theta - targetTheta)) < thetaTolerance) {
         brain->client->setVelocity(0, 0, 0);
         return NodeStatus::SUCCESS;
     }
 
-    auto targetPose_r = brain->data->field2robot(targetPose);
-    double vx = targetPose_r.x;
-    double vy = targetPose_r.y;
-    double vtheta = brain->data->ball.yawToRobot * 4.0; 
-
-
-    double vxLimit, vyLimit;
-    getInput("vx_limit", vxLimit);
-    getInput("vy_limit", vyLimit);
-    vx = cap(vx, vxLimit, -vxLimit);    
-    vy = cap(vy, vyLimit, -vyLimit);    
+    // 使用场地位姿控制
+    brain->client->moveToPoseOnField2(
+        targetPose.x, targetPose.y, targetTheta, 
+        1.0, 0.5, // 宽松的参数
+        1.0, 0.6, 1.5, // 速度限制：守门员横移要快 (vy=0.6)
+        distTolerance/2, distTolerance/2, thetaTolerance, 
+        false // 守门员通常不需要避障，直接到位
+    );
     
+    // 可视化预测点
+    brain->log->setTimeNow();
+    brain->log->logBall("field/goalie_target", Point({targetPose.x, targetPose.y, 0}), 0x0000FFFF, false, false);
 
-    brain->client->setVelocity(vx, vy, vtheta, false, false, false);
     return NodeStatus::SUCCESS;
 }
 
